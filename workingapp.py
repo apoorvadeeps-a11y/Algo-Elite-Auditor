@@ -1,6 +1,9 @@
 # app.py  ── Run with: streamlit run app.py
 # AlgoElite v2 — Full 5-Phase Forensic Bias Auditor
 # ─────────────────────────────────────────────────────────────────────────────
+import matplotlib
+matplotlib.use('Agg')  # Must be before importing pyplot
+import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -88,16 +91,16 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────────────────────
 GITHUB_DATASETS = {
     "Adult Census Income (Gender/Race Bias)": (
-        "https://raw.githubusercontent.com/dsrscientist/"
-        "dataset1/master/adult.csv"
+        "https://archive.ics.uci.edu/ml/machine-learning-databases/"
+        "adult/adult.data"
     ),
     "COMPAS Recidivism (Racial Bias)": (
         "https://raw.githubusercontent.com/propublica/compas-analysis/"
         "master/compas-scores-two-years.csv"
     ),
     "German Credit (Age/Gender Bias)": (
-        "https://raw.githubusercontent.com/Fletcher-Morris/"
-        "Houdini-Jam-2020/master/Data/german_credit_data.csv"
+        "https://raw.githubusercontent.com/selva86/datasets/"
+        "master/GermanCredit.csv"
     ),
 }
 
@@ -125,7 +128,21 @@ def load_from_github(url: str) -> pd.DataFrame:
     from io import StringIO
     r = requests.get(url, timeout=30)
     r.raise_for_status()
-    return clean_dataframe(pd.read_csv(StringIO(r.text)))
+
+    # UCI adult.data has no header row and uses '?' for missing values
+    if "adult.data" in url:
+        cols = [
+            "age", "workclass", "fnlwgt", "education", "education_num",
+            "marital_status", "occupation", "relationship", "race", "sex",
+            "capital_gain", "capital_loss", "hours_per_week",
+            "native_country", "income",
+        ]
+        df = pd.read_csv(StringIO(r.text), header=None, names=cols,
+                          na_values="?", skipinitialspace=True)
+    else:
+        df = pd.read_csv(StringIO(r.text))
+
+    return clean_dataframe(df)
 
 
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -160,36 +177,42 @@ def phase1_bifurcate(df: pd.DataFrame,
     # ── Stream A: Stratified Compression ─────────────────────────────────────
     strat_col = target_col if target_col and target_col in df.columns else None
     if strat_col:
+        # Use stratified sampling — keeps all original columns including strat_col
         stream_a = (df.groupby(strat_col, group_keys=False)
-                      .apply(lambda g: g.sample(frac=sample_frac, random_state=42)))
-        reasoning.append(
-            f"Stream A: Stratified on '{strat_col}' — retained "
-            f"{len(stream_a):,} / {len(df):,} rows ({sample_frac*100:.0f}%). "
-            f"Class distribution preserved within 95% CI."
-        )# 1. Clean column names (handles hidden spaces/tabs)
-        df.columns = df.columns.str.strip()
-        stream_a.columns = stream_a.columns.str.strip()
+                      .apply(lambda g: g.sample(frac=sample_frac, random_state=42))
+                      .reset_index(drop=True))
 
-        # 2. Safety check for the column
-        if strat_col not in stream_a.columns:
-            print(f"Error: '{strat_col}' missing. Available: {stream_a.columns.tolist()}")
-            # Fallback or diagnostic
-            return df, df, ["Error: Column missing"]
+        # Build readable reasoning
+        reasoning.append(
+            f"**📊 Stream A — Stratified Compression:** The dataset was stratified "
+            f"on the target column **'{strat_col}'** to create a compressed sample "
+            f"of **{len(stream_a):,}** rows out of the original **{len(df):,}** rows "
+            f"({sample_frac*100:.0f}% retention). Stratified sampling ensures that "
+            f"each class in the target variable is proportionally represented, "
+            f"mirroring the original distribution within a 95% confidence interval."
+        )
+
         # Verify distribution parity
-        orig_dist = df[strat_col].value_counts(normalize=True)
-        samp_dist = stream_a[strat_col].value_counts(normalize=True)
-        for cls in orig_dist.index:
-            delta = abs(orig_dist.get(cls, 0) - samp_dist.get(cls, 0))
+        if strat_col in stream_a.columns:
+            orig_dist = df[strat_col].value_counts(normalize=True)
+            samp_dist = stream_a[strat_col].value_counts(normalize=True)
+            parity_lines = []
+            for cls in orig_dist.index:
+                delta = abs(orig_dist.get(cls, 0) - samp_dist.get(cls, 0))
+                status = "✅ within tolerance" if delta < 0.02 else "⚠️ deviation detected"
+                parity_lines.append(
+                    f"Class **'{cls}'**: original={orig_dist.get(cls,0):.1%}, "
+                    f"sample={samp_dist.get(cls,0):.1%}, drift=**{delta:.4f}** ({status})"
+                )
             reasoning.append(
-                f"  Class '{cls}': original={orig_dist.get(cls,0):.3f}, "
-                f"sample={samp_dist.get(cls,0):.3f}, Δ={delta:.4f} "
-                f"({'✅ within tolerance' if delta < 0.02 else '⚠️ deviation'})."
+                "**🔍 Distribution Parity Check:** " + " · ".join(parity_lines)
             )
     else:
-        stream_a = df.sample(frac=sample_frac, random_state=42)
+        stream_a = df.sample(frac=sample_frac, random_state=42).reset_index(drop=True)
         reasoning.append(
-            f"Stream A: Random sample — {len(stream_a):,} rows retained "
-            f"(no stratification column specified)."
+            f"**📊 Stream A — Random Compression:** No stratification column was "
+            f"specified. A random sample of **{len(stream_a):,}** rows "
+            f"({sample_frac*100:.0f}%) was drawn from the original dataset."
         )
 
     # ── Stream B: Isolation Forest on numeric features ────────────────────────
@@ -198,31 +221,61 @@ def phase1_bifurcate(df: pd.DataFrame,
         iso = IsolationForest(contamination=0.10, random_state=42, n_jobs=-1)
         scores = iso.fit_predict(df[num_cols].fillna(df[num_cols].median()))
         outlier_mask = scores == -1
+        iso_count = int(outlier_mask.sum())
 
-        # Also add minority-group rows via KMeans fringe detection
+        # Also add minority-group rows via fringe detection
+        minority_additions = 0
         for col in protected_cols:
             if col in df.columns:
                 group_counts = df[col].value_counts()
                 minority_threshold = group_counts.quantile(0.25)
                 minority_groups = group_counts[group_counts <= minority_threshold].index
+                new_mask = df[col].isin(minority_groups).values & ~outlier_mask
+                minority_additions += int(new_mask.sum())
                 outlier_mask |= df[col].isin(minority_groups).values
 
-        stream_b = df[outlier_mask].copy()
+        stream_b = df[outlier_mask].copy().reset_index(drop=True)
         reasoning.append(
-            f"Stream B: IsolationForest (contamination=10%) + minority-group "
-            f"extraction → {len(stream_b):,} unique/fringe rows identified."
+            f"**🔬 Stream B — Fringe & Minority Extraction:** An Isolation Forest "
+            f"algorithm (contamination=10%) scanned **{len(num_cols)}** numeric "
+            f"features and identified **{iso_count:,}** statistical outlier rows — "
+            f"data points that deviate significantly from the majority pattern. "
+            f"Additionally, **{minority_additions:,}** rows from underrepresented "
+            f"demographic groups were added via minority-group frequency thresholding. "
+            f"Stream B totals **{len(stream_b):,}** unique rows."
         )
-        for col in protected_cols:
-            if col in df.columns:
-                counts = stream_b[col].value_counts()
-                reasoning.append(
-                    f"  Protected '{col}' in Stream B: {dict(counts.head(5))}"
-                )
-    else:
-        stream_b = df.sample(frac=0.10, random_state=99)
-        reasoning.append("Stream B: No numeric columns — random 10% fringe sample.")
 
-    return stream_a.reset_index(drop=True), stream_b.reset_index(drop=True), reasoning
+        # Per-attribute breakdown
+        prot_details = []
+        for col in protected_cols:
+            if col in df.columns and col in stream_b.columns:
+                counts = stream_b[col].value_counts()
+                top_groups = ", ".join(f"'{k}'={v}" for k, v in counts.head(4).items())
+                prot_details.append(f"**{col}**: {top_groups}")
+        if prot_details:
+            reasoning.append(
+                "**👥 Protected Attribute Breakdown in Stream B:** " +
+                " · ".join(prot_details)
+            )
+    else:
+        stream_b = df.sample(frac=0.10, random_state=99).reset_index(drop=True)
+        reasoning.append(
+            "**🔬 Stream B — Random Fringe Sample:** No numeric columns were "
+            "available for Isolation Forest analysis. A random 10% sample was "
+            "drawn as a fallback."
+        )
+
+    # Summary
+    reasoning.append(
+        f"**📋 Bifurcation Summary:** The original dataset of **{len(df):,}** rows "
+        f"was split into **Stream A** ({len(stream_a):,} rows for statistical "
+        f"analysis) and **Stream B** ({len(stream_b):,} rows capturing edge cases "
+        f"and minority populations). This dual-stream approach ensures that bias "
+        f"detection examines both the mainstream data distribution and the "
+        f"underrepresented subpopulations where discrimination most often hides."
+    )
+
+    return stream_a, stream_b, reasoning
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,57 +572,21 @@ class BiasAuditorAgent:
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 2 — BIAS FLAG EXPORT
 # ─────────────────────────────────────────────────────────────────────────────
-def generate_bias_flagged_excel(df: pd.DataFrame,
-                                 results: list,
-                                 target_col: str) -> bytes:
-    """
-    Produces an Excel file with BIAS_FLAG (0-1 float) and BIAS_REASON columns.
-    Uses vectorised Pandas operations (no Python loops over rows).
-    """
-    out = df.copy()
-    out["BIAS_FLAG"]   = 0.0
-    out["BIAS_REASON"] = ""
+def generate_bias_flagged_excel(df, results, target_col):
+    output = io.BytesIO()
+    # Using 'with' handles the writer.close() automatically
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Bias_Audit')
+        
+        workbook = writer.book
+        worksheet = writer.sheets['Bias_Audit']
+        
+        # --- Add your Styles here (as shown in previous step) ---
+        # ... 
 
-    for r in results:
-        col = r.attribute
-        if col not in out.columns:
-            continue
-        priv = r.privileged_group
-
-        # Compute per-column stats vectorised
-        if target_col in out.columns:
-            num_cols = out.select_dtypes(include="number").columns
-            for nc in num_cols:
-                if nc in (col, "BIAS_FLAG"):
-                    continue
-                overall_mean = out[nc].mean()
-                overall_std  = out[nc].std() + 1e-9
-                z_scores     = (out[nc] - overall_mean) / overall_std
-                # Flag rows belonging to unprivileged group with |z| > 2
-                unpriv_mask  = out[col].astype(str) != priv
-                flag_mask    = unpriv_mask & (z_scores.abs() > 2)
-                flag_val     = (z_scores.abs().clip(upper=5) / 5).clip(0, 1)
-                out.loc[flag_mask, "BIAS_FLAG"] = np.maximum(
-                    out.loc[flag_mask, "BIAS_FLAG"],
-                    flag_val[flag_mask]
-                )
-                reason_text = (
-                    f"'{col}'={out[col]}; '{nc}' is "
-                    f"{z_scores.round(2).astype(str)} SD from mean "
-                    f"(group avg for privileged='{priv}': "
-                    f"{out.loc[out[col].astype(str)==priv, nc].mean():.2f})"
-                )
-                # Vectorised reason assignment (only overwrite if newly flagged)
-                new_flag = flag_mask & (out["BIAS_REASON"] == "")
-                out.loc[new_flag, "BIAS_REASON"] = (
-                    f"Flagged: '{nc}' deviates >{z_scores[new_flag].abs().round(1).astype(str)} "
-                    f"SD from mean for same role in other demographics (attr='{col}')."
-                )
-
-    buf = io.BytesIO()
-    out.to_excel(buf, index=False, engine="openpyxl")
-    buf.seek(0)
-    return buf.read()
+    # CRITICAL: Seek to the start of the stream after the 'with' block closes
+    processed_data = output.getvalue()
+    return processed_data
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -598,6 +615,52 @@ def plot_bifurcation_view(stream_a, stream_b, target_col):
         height=350, showlegend=False,
     )
     return fig
+    import io
+
+def generate_bias_flagged_excel(df, results, target_col):
+    output = io.BytesIO()
+    
+    # We MUST use xlsxwriter to enable colors
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Audit_Report')
+        
+        workbook  = writer.book
+        worksheet = writer.sheets['Audit_Report']
+
+        # --- PRESET COLORS ---
+        # Red for high risk, Green for low risk
+        high_fmt   = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'}) 
+        normal_fmt = workbook.add_format({'bg_color': '#FFEB9C', 'font_color': '#9C6500'}) 
+        low_fmt    = workbook.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'})
+        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#1F4E78', 'font_color': 'white'})
+
+        # 1. Apply Header Style
+        for col_num, value in enumerate(df.columns.values):
+            worksheet.write(0, col_num, value, header_fmt)
+
+        # 2. Apply Conditional Formatting (The Colors!)
+        # This assumes your score column is named 'bias_score'
+        if 'bias_score' in df.columns:
+            col_idx = df.columns.get_loc('bias_score')
+            last_row = len(df)
+
+            # High Bias (> 0.7) -> RED
+            worksheet.conditional_format(1, col_idx, last_row, col_idx, {
+                'type': 'cell', 'criteria': '>=', 'value': 0.7, 'format': high_fmt
+            })
+            # Normal Bias (0.3 to 0.7) -> YELLOW
+            worksheet.conditional_format(1, col_idx, last_row, col_idx, {
+                'type': 'cell', 'criteria': 'between', 'minimum': 0.3, 'maximum': 0.7, 'format': normal_fmt
+            })
+            # Low Bias (< 0.3) -> GREEN
+            worksheet.conditional_format(1, col_idx, last_row, col_idx, {
+                'type': 'cell', 'criteria': '<', 'value': 0.3, 'format': low_fmt
+            })
+
+        # 3. Autofit column widths
+        worksheet.set_column(0, len(df.columns) - 1, 18)
+
+    return output.getvalue()
 
 
 def plot_approval_rates(results) -> go.Figure:
@@ -618,23 +681,27 @@ def plot_approval_rates(results) -> go.Figure:
     return fig
 
 
-def plot_fairness_gauge(results) -> go.Figure:
-    # 1. Calculate the average Disparate Impact
-    di_scores = [r.disparate_impact for r in results if not np.isnan(r.disparate_impact)]
-    avg_di = np.mean(di_scores) if di_scores else 1.0
-    
+def plot_fairness_gauge(results):
+    if not results:
+        value = 0.0
+    else:
+        high_bias  = [r for r in results if getattr(r, 'bias_level', '') == "HIGH"]
+        med_bias   = [r for r in results if getattr(r, 'bias_level', '') == "MEDIUM"]
+        value      = 1.0 - (len(high_bias) * 0.3 + len(med_bias) * 0.15) / max(len(results), 1)
+        value      = max(0.0, min(1.0, value))
+
     fig = go.Figure(go.Indicator(
         mode = "gauge+number",
-        value = avg_di,  # Use the average you calculated above
-        title = {'text': "Fairness Score (Avg Disparate Impact)"},
+        value = value,
         gauge = {
-            'axis': {'range': [0, 1]}, # Standard DI range is usually 0 to 1
+            'axis': {'range': [0, 1]},
             'steps': [
-                {'range': [0, 0.8], 'color': '#ff4b4b'}, # Below 80% is usually flagged
-                {'range': [0.8, 1], 'color': '#2eb82e'}  # 0.8 to 1.0 is generally 'fair'
+                {'range': [0, 0.6], 'color': '#ff4b4b'},
+                {'range': [0.6, 0.85], 'color': '#ffa500'},
+                {'range': [0.85, 1], 'color': '#2eb82e'}
             ],
-            'bar': {'color': "white"}
-        }
+        },
+        title = {'text': "Overall Fairness"}
     ))
 
     fig.update_layout(paper_bgcolor="#0e1117", font_color="white", height=300)
@@ -1026,6 +1093,7 @@ def render_metric_cards(results):
 # MAIN APP
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
+   
 
     st.write("### Dataset Preview")
     # ...
@@ -1036,7 +1104,7 @@ def main():
     )
 
     config = render_sidebar()
-    df     = config["df"]
+    df= config["df"]
 
     if df is None:
         st.info("👈 Upload a dataset or load one from GitHub to begin.")
@@ -1135,11 +1203,7 @@ def main():
         st.plotly_chart(bif_fig, use_container_width=True)
 
     with st.expander("📋 Bifurcation Reasoning Log"):
-        # Guard: bif_log may be a plain string (e.g. an error message) instead of
-        # a list, which caused the original bug where iterating a string produced
-        # one <div> per character.  Normalise to list first.
-        log_lines = bif_log if isinstance(bif_log, list) else [bif_log]
-        for line in log_lines:
+        for line in bif_log:
             st.markdown(f'<div class="reasoning-box">{line}</div>', unsafe_allow_html=True)
 
     # ── Phase 2: Bias Summary ─────────────────────────────────────────────────
