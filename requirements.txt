@@ -1,9 +1,12 @@
 streamlit
 pandas
 numpy
-plotly
 scikit-learn
-xlsxwriter
+plotly
 openpyxl
+xlsxwriter
+imbalanced-learn
+google-generativeai
+reportlab
+requests
 matplotlib
-jinja2
